@@ -1,0 +1,22 @@
+DATA:
+    ROOT: '/PATH/TO/videos'
+    TRAIN_FILE: '/PATH/TO/train.txt'
+    VAL_FILE: '/PATH/TO/val.txt'
+    DATASET: kinetics400
+    NUM_FRAMES: 1
+    NUM_CLASSES: 400
+    LABEL_LIST: 'labels/kinetics_400_labels.csv'
+    CLIP_LEN: 32
+    SAMPLE_RATE: 4
+T2D:
+    WIDTH: 768
+    PATCH_SIZE: [2, 16, 16]
+    LAYERS: 12
+    HEADS: 12
+    FRAMES: 32
+    USE_TEXT_CLASSIFIER: False
+MODEL:
+    ARCH: ViT-B/16
+TRAIN:
+    BATCH_SIZE: 4
+    ACCUMULATION_STEPS: 8

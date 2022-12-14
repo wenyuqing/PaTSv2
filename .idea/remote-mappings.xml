@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="RemoteMappingsManager">
+    <list>
+      <list>
+        <remote-mappings server-id="python@sftp://FAREAST.v-yuczhao@localhost:10666/anaconda/envs/slowfast1.11.0/bin/python">
+          <settings>
+            <list>
+              <mapping local-root="$PROJECT_DIR$" remote-root="/home/v-yuczhao/code/xclip" />
+            </list>
+          </settings>
+        </remote-mappings>
+        <remote-mappings server-id="python@sftp://FAREAST.v-wenyuqing@GCRSANDBOX224.redmond.corp.microsoft.com:22/home/v-wenyuqing/anaconda3/envs/xclip/bin/python3.8">
+          <settings>
+            <list>
+              <mapping local-root="$PROJECT_DIR$" remote-root="/home/v-wenyuqing/code/Pats/yc_v3" />
+            </list>
+          </settings>
+        </remote-mappings>
+      </list>
+    </list>
+  </component>
+</project>

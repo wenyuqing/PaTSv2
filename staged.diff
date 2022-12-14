@@ -1,0 +1,1000 @@
+diff --git models/model_2d_stream_cls_visualize.py models/model_2d_stream_cls_visualize.py
+new file mode 100644
+index 0000000..547c605
+--- /dev/null
++++ models/model_2d_stream_cls_visualize.py
+@@ -0,0 +1,486 @@
++import os
++from collections import OrderedDict
++from tqdm import tqdm
++from functools import lru_cache
++
++import numpy as np
++import torch
++from torch import nn
++from torch.nn.init import xavier_uniform_, constant_
++import torch.nn.functional as F
++import torch.utils.checkpoint as checkpoint
++from torch.utils.checkpoint import checkpoint_sequential
++from einops import rearrange, repeat
++import clip
++from .prompt import VideoSpecificPrompt
++
++from .k400_class import K400_CLASS
++
++
++SINGLE_PROMPT = ["a video of a person {}."]
++
++
++class CLIPTextClassifier(nn.Module):
++    def __init__(self, pretrain, backbone_name, num_classes=400, bias=False, embed_dim=512,):
++        super(CLIPTextClassifier, self).__init__()
++
++        text_features, logit_scale = self.get_text_features(pretrain, backbone_name)
++        self.logit_scale = nn.Parameter(logit_scale)
++        self.register_buffer('text_features', text_features)
++        self.bias = None
++        if bias:
++            self.bias = nn.Parameter(torch.zeros(num_classes))
++
++    def forward(self, x):
++        x = x / x.norm(dim=1, keepdim=True)
++        logit_scale = self.logit_scale.exp()
++        text_features = self.text_features.unsqueeze(0).expand(x.shape[0], -1, -1)
++        x = logit_scale * (x.unsqueeze(1) @ text_features).squeeze(1)  # [B, C] @ [B, C, n_class] -> [B, n_class]
++        if self.bias is not None:
++            x = x + self.bias
++        if not self.training:
++            x = F.softmax(x, dim=1)
++        return x
++
++    @staticmethod
++    def get_text_features(pretrain, backbone_name='ViT-B/16'):
++        prompts = SINGLE_PROMPT
++        classnames = [_[0] for _ in sorted(K400_CLASS, key=lambda x: x[1])]
++        clip_model = clip.load(backbone_name, download_root=os.path.dirname(pretrain))[0]
++        clip_model = clip_model.to(torch.float32)
++        text_encoder = clip_model.encode_text
++        tokenizer = lambda x: clip.tokenize(x).cuda()
++        texts_weights = []
++        for classname in tqdm(classnames):
++            texts = [prompt.format(classname).lower() for prompt in prompts]
++            texts = tokenizer(texts)
++            with torch.no_grad():
++                class_embeddings = text_encoder(texts)
++            class_embeddings /= class_embeddings.norm(dim=-1, keepdim=True)
++            class_embedding = class_embeddings.mean(dim=0)
++            class_embedding /= class_embedding.norm()
++            texts_weights.append(class_embedding)
++        text_features = torch.stack(texts_weights, dim=1)
++        text_features = text_features / text_features.norm(dim=0, keepdim=True)
++        return text_features, clip_model.state_dict()['logit_scale']
++
++
++class TransformerBasicHead(nn.Module):
++    """
++    BasicHead. No pool.
++    """
++
++    def __init__(
++        self,
++        dim_in,
++        num_classes,
++        dropout_rate=0.0,
++        act_func="softmax",
++    ):
++        super(TransformerBasicHead, self).__init__()
++        if dropout_rate > 0.0:
++            self.dropout = nn.Dropout(dropout_rate)
++        self.projection = nn.Linear(dim_in, num_classes, bias=True)
++
++        # Softmax for evaluation and testing.
++        if act_func == "softmax":
++            self.act = nn.Softmax(dim=1)
++        elif act_func == "sigmoid":
++            self.act = nn.Sigmoid()
++        else:
++            raise NotImplementedError(
++                "{} is not supported as an activation"
++                "function.".format(act_func)
++            )
++
++    def forward(self, x):
++        if hasattr(self, "dropout"):
++            x = self.dropout(x)
++        x = self.projection(x)
++
++        if not self.training:
++            x = self.act(x)
++        return x
++
++
++def inflate_weight(state_dict_2d, state_dict_3d):
++    # copy from slowfast.checkpoint
++    from collections import OrderedDict
++    state_dict_inflated = OrderedDict()
++    for k, v2d in state_dict_2d.items():
++        if k not in state_dict_3d.keys():
++            print(f"Unknown key {k} from 2d dict")
++            continue
++        v3d = state_dict_3d[k]
++        # Inflate the weight of 2D conv to 3D conv.
++        if len(v2d.shape) == 4 and len(v3d.shape) == 5:
++            print(
++                "Inflate {}: {} -> {}: {}".format(k, v2d.shape, k, v3d.shape)
++            )
++            # Dimension need to be match.
++            assert v2d.shape[-2:] == v3d.shape[-2:]
++            assert v2d.shape[:2] == v3d.shape[:2]
++            v3d = (
++                    v2d.unsqueeze(2).repeat(1, 1, v3d.shape[2], 1, 1) / v3d.shape[2]
++            )
++        elif v2d.shape == v3d.shape:
++            v3d = v2d
++        else:
++            print(
++                "Unexpected {}: {} -|> {}: {}".format(
++                    k, v2d.shape, k, v3d.shape
++                )
++            )
++        state_dict_inflated[k] = v3d.clone()
++    return state_dict_inflated
++
++
++class MySequential(nn.Sequential):
++    def forward(self, *inputs):
++        for module in self._modules.values():
++            if type(inputs) == tuple:
++                inputs = module(*inputs)
++            else:
++                inputs = module(inputs)
++        return inputs
++
++
++class LayerNorm(nn.LayerNorm):
++    """Subclass torch's LayerNorm to handle fp16."""
++
++    def forward(self, x: torch.Tensor):
++        orig_type = x.dtype
++        ret = super().forward(x.type(torch.float32))
++        return ret.type(orig_type)
++
++
++class QuickGELU(nn.Module):
++    def forward(self, x: torch.Tensor):
++        return x * torch.sigmoid(1.702 * x)
++
++
++class Attention(nn.Module):
++    def __init__(self,
++                 embed_dim,
++                 num_heads,
++                 attn_type='full',
++                 visualize=False,):
++        super(Attention, self).__init__()
++        assert attn_type in ['full']
++        self.visualize=visualize
++        self.attn_type = attn_type
++        self.num_heads = num_heads
++        self.scale = (embed_dim // num_heads) ** -0.5
++        self.in_proj_weight = nn.Parameter(torch.empty((3 * embed_dim, embed_dim)))
++        self.in_proj_bias = nn.Parameter(torch.empty(3 * embed_dim))
++
++        self.out_proj = nn.Linear(embed_dim, embed_dim)
++
++        self._reset_parameters()
++
++
++    def _reset_parameters(self):
++        xavier_uniform_(self.in_proj_weight)
++        constant_(self.in_proj_bias, 0.)
++        constant_(self.out_proj.bias, 0.)
++
++    def attention(self, q, k, v, mask=None):
++        attn = (q @ k.transpose(-2, -1))
++        if mask is not None:
++            attn = attn.masked_fill(mask, -1e3)
++        attn = attn.softmax(-1)
++        o = (attn @ v)
++        if self.visualize:
++            return o,attn
++        else:
++            return o
++
++    def _forward_in_frame(self, x):
++        x = F.linear(x, self.in_proj_weight, self.in_proj_bias)
++        qkv = rearrange(x, 'b n (three num_heads head_c) -> three b num_heads n head_c',
++                        three=3, num_heads=self.num_heads)
++        q, k, v = qkv.unbind(0)
++        q = q * self.scale
++        if self.visualize:
++            x,attn = self.attention(q, k, v)
++        else:
++            x = self.attention(q, k, v)
++
++        x = rearrange(x, 'b num_heads n head_c -> b n (num_heads head_c)')
++        x = self.out_proj(x)
++        if self.visualize:
++            return x,attn
++        else:
++            return x
++
++    def forward(self, x, size):
++        """[B N C]"""
++        if self.visualize:
++            x , attn= self._forward_in_frame(x)
++            return x,attn
++        else:
++            x = self._forward_in_frame(x)
++            return x
++
++
++class ResidualAttentionBlock(nn.Module):
++    def __init__(self, d_model: int, n_head: int, attn_type: str = 'full',visualize=False):
++        super().__init__()
++        self.visualize=visualize
++        self.attn = Attention(d_model, n_head, attn_type,visualize)
++        self.ln_1 = LayerNorm(d_model)
++        self.mlp = nn.Sequential(OrderedDict([
++            ("c_fc", nn.Linear(d_model, d_model * 4)),
++            ("gelu", QuickGELU()),
++            ("c_proj", nn.Linear(d_model * 4, d_model))
++        ]))
++        self.ln_2 = LayerNorm(d_model)
++
++    def forward(self, x: torch.Tensor, size):
++        if self.visualize:
++            x_,attn=self.attn(self.ln_1(x), size)
++            x = x + x_
++            x = x + self.mlp(self.ln_2(x))
++            return x, size, attn
++        else:
++            x = x + self.attn(self.ln_1(x), size)
++            x = x + self.mlp(self.ln_2(x))
++            return x, size
++
++
++class Transformer(nn.Module):
++    def __init__(self, width: int, layers: int, heads: int, attn_type='full', enable_checkpoint=False):
++        super().__init__()
++        self.width = width
++        self.layers = layers
++
++        self.resblocks = MySequential(*[ResidualAttentionBlock(width, heads, attn_type) for _ in range(layers)])
++        self.enable_checkpoint = enable_checkpoint
++
++    def forward(self, x: torch.Tensor, size):
++        checkpoint_segment = 2
++        if self.enable_checkpoint:
++            x, size = sequential_checkpoint(self.resblocks, checkpoint_segment, x, size)
++            return x
++        else:
++            return self.resblocks(x, size)[0]
++class TransformerL(nn.Module):
++    def __init__(self, width: int, layers: int, heads: int, attn_type='full', enable_checkpoint=False,visualize=False):
++        super().__init__()
++        self.width = width
++        self.layers = layers
++        self.visualize=visualize
++
++        self.resblocks =  nn.ModuleList([ResidualAttentionBlock(width, heads, attn_type,visualize) for _ in range(layers)])
++        self.enable_checkpoint = enable_checkpoint
++
++    def forward(self, x: torch.Tensor, size):
++        checkpoint_segment = 2
++        if self.enable_checkpoint:
++            x, size = sequential_checkpoint(self.resblocks, checkpoint_segment, x, size)
++            return x
++        else:
++            if self.visualize:
++                for i, blk in enumerate(self.resblocks):
++                    x, size,attn = blk(x, size)
++                    return x,attn
++            else:
++                for i, blk in enumerate(self.resblocks):
++                    x, size = blk(x, size)
++                return x
++
++def sequential_checkpoint(functions, segments, *input):
++    if isinstance(functions, torch.nn.Sequential):
++        functions = list(functions.children())
++
++    def run_function(start, end, functions):
++        def forward(*input):
++            for j in range(start, end + 1):
++                input = functions[j](*input)
++            return input
++        return forward
++
++    if isinstance(functions, torch.nn.Sequential):
++        functions = list(functions.children())
++
++    segment_size = len(functions) // segments
++    # the last chunk has to be non-volatile
++    end = -1
++    for start in range(0, segment_size * (segments - 1), segment_size):
++        end = start + segment_size - 1
++        input = checkpoint.checkpoint(run_function(start, end, functions), *input)
++    input = run_function(end + 1, len(functions) - 1, functions)(*input)
++    return input
++
++
++class CLIP2DSCLS(nn.Module):
++    def __init__(self,
++                 num_classes=400,
++                 width=768,
++                 patch_size=(2, 16, 16),
++                 layers=12,
++                 heads=12,
++                 input_resolution=224,
++                 frames=32,
++                 pretrain=None,
++                 temporal_model='avg',
++                 temporal_layer=4,
++                 enable_checkpoint=False,
++                 use_text_classifier=True,
++                 text_dim=512,
++                 text_heads=8,
++                 text_backbone_name='ViT-B/16',
++                 text_bias=False,
++                 imagenet_pretrain=None,
++                 batch_mode=False,
++                 use_cls_token=False,
++                 visualize=False,
++                 ):
++        # input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int
++        super().__init__()
++        self.visualize=visualize
++        # build model
++        self.batch_mode = batch_mode
++        self.input_resolution = input_resolution
++        self.frames = frames
++        self.enable_checkpoint = enable_checkpoint
++        self.use_text_classifier = use_text_classifier
++
++        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size[1:], stride=patch_size[1:],
++                               bias=False)
++        scale = width ** -0.5
++        self.use_cls_token = use_cls_token
++        if self.use_cls_token:
++            print("!!!!!use cls token!!!!")
++            self.class_embedding = nn.Parameter(scale * torch.randn(width))
++        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size[1]) ** 2 +
++                                                                     (1 if self.use_cls_token else 0), width))
++
++
++        self.prompts_embedding = nn.Parameter(scale * torch.randn(1, 4, width))
++        self.prompts_pos = nn.Parameter(scale * torch.randn(1, 4 * 2, width))
++        self.prompts_init_out = nn.Parameter(scale * torch.randn(1, 4, width))
++
++        self.prompts_projection = nn.Sequential(nn.Linear(width, width, bias=False),
++                                                nn.LayerNorm(width))
++        self.ln_pre = LayerNorm(width)
++        self.transformer = TransformerL(width, layers, heads, 'full', enable_checkpoint,visualize=visualize)
++        self.ln_post = LayerNorm(width)
++
++        if self.use_text_classifier:
++            self.proj = nn.Parameter(torch.randn(width, text_dim))
++            self.head = CLIPTextClassifier(pretrain, text_backbone_name, num_classes, bias=text_bias, embed_dim=text_dim)
++        else:
++            self.head = TransformerBasicHead(
++                width,
++                num_classes,
++                dropout_rate=0.5,
++            )
++
++        # temporal modeling model
++        self.temporal_model = temporal_model
++        if temporal_model == 'transformer':
++            t_width = text_dim if self.use_text_classifier else width
++            t_head = text_heads if self.use_text_classifier else heads
++            self.model_t_pos = nn.Parameter(scale * torch.randn((frames // patch_size[0]), t_width))
++            self.model_t = Transformer(t_width,
++                                       temporal_layer,
++                                       t_head, 'full')
++
++        self._initialize_weights()
++        self._load_pretrain(pretrain)
++        self._load_in_pretrain(imagenet_pretrain)
++
++    def _initialize_weights(self):
++        nn.init.normal_(self.positional_embedding, std=0.02)
++        nn.init.normal_(self.prompts_embedding, std=0.02)
++        nn.init.normal_(self.prompts_pos, std=0.02)
++        nn.init.normal_(self.prompts_init_out, std=0.02)
++        if self.temporal_model == 'transformer':
++            nn.init.normal_(self.model_t_pos, std=0.02)
++        if self.use_cls_token:
++            nn.init.normal_(self.class_embedding, std=0.02)
++
++
++    def _load_in_pretrain(self, pretrain):
++        if pretrain is None or not os.path.exists(pretrain):
++            return
++        print(f'Loading network weights from {pretrain}')
++        checkpoint = torch.load(pretrain, map_location='cpu')
++        load_state_dict = checkpoint['model']
++        model_state_dict_3d = self.state_dict()
++
++        print('inflate weights')
++        load_state_dict = inflate_weight(load_state_dict, model_state_dict_3d)
++        msg = self.load_state_dict(load_state_dict, strict=False)
++        print(f"resume model: {msg}")
++
++    def _load_pretrain(self, pretrain):
++        if pretrain is None or not os.path.exists(pretrain):
++            return
++        print(f'Loading network weights from {pretrain}')
++        model_state_dict_3d = self.state_dict()
++
++        clip_model = torch.jit.load(pretrain, map_location='cpu')
++        clip_model = clip_model.visual
++        model_state_dict_2d = clip_model.state_dict()
++
++        # remove pos embed for class token
++       # model_state_dict_2d['positional_embedding'] = model_state_dict_2d['positional_embedding'][1:]
++
++        inflated_model_dict = inflate_weight(model_state_dict_2d, model_state_dict_3d)
++        msg = self.load_state_dict(inflated_model_dict, strict=False)
++        print(msg)
++        print('Pretrained network weights loaded.')
++
++    def forward_features(self, x: torch.Tensor):
++        B = x.shape[0]
++        x = rearrange(x, 'b c t h w -> (b t) c h w')
++        x = self.conv1(x)
++        size = list(x.shape[2:])
++        T = x.shape[0] // B
++        x = rearrange(x, '(b t) c h w -> t b (h w) c', b=B)
++
++        pos_embed = rearrange(self.positional_embedding, 'hw c -> 1 1 hw c')
++        x = torch.cat([self.class_embedding + torch.zeros(x.shape[0], x.shape[1],1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=2)
++        x = x + pos_embed
++
++        x = self.ln_pre(x)
++
++        outs = []
++        prompts_in = self.prompts_embedding + torch.zeros(B, 1, 1, device=x.device)
++        prompts_out = self.prompts_init_out + torch.zeros(B, 1, 1, device=x.device)
++        for i in range(T):
++            prompts = torch.cat([prompts_in, prompts_out], dim=1) + self.prompts_pos
++            out = self.transformer(torch.cat([prompts, x[i]], dim=1), size)
++            prompts_out = self.prompts_projection(out[:, :4])
++            # outs.append(out[:, 8:].mean(dim=1))
++            if self.use_cls_token:
++                outs.append(out[:, 8])
++            else:
++                outs.append(out[:, 4:8].mean(dim=1))
++        x = torch.stack(outs, dim=1)  # b t c
++
++        x = self.ln_post(x)
++
++        if self.use_text_classifier:
++            x = x @ self.proj
++        return x
++
++    def forward(self, x, text):
++        # b t c h w -> b c t h w
++        x = x.permute(0, 2, 1, 3, 4)
++        x = self.forward_features(x)
++        if self.temporal_model == 'avg':
++            x = x.mean(dim=1)
++        elif self.temporal_model == 'transformer':
++            orig_x = x
++            x = x + self.model_t_pos
++            x = self.model_t(x, None)
++            x = x + orig_x
++            x = x.mean(dim=1)
++        else:
++            raise NotImplementedError
++
++        x = self.head(x)
++        return x
+\ No newline at end of file
+diff --git tools/Qtrain_k400.sh tools/Qtrain_k400.sh
+new file mode 100644
+index 0000000..014daa7
+--- /dev/null
++++ tools/Qtrain_k400.sh
+@@ -0,0 +1,63 @@
++#!/usr/bin/env bash
++set -x
++
++echo 'set up environment...'
++export MKL_THREADING_LAYER=GNU
++GPU_PER_NODE_COUNT=`nvidia-smi -L | wc -l`
++[[ -z "$AZUREML_NODE_COUNT" ]] && NODE_COUNT=1 || NODE_COUNT=$AZUREML_NODE_COUNT
++[[ -z "$AZ_BATCHAI_TASK_INDEX" ]] && RANK=0 || RANK=$AZ_BATCHAI_TASK_INDEX
++[[ -z "$MASTER_ADDR" ]] && MASTER_ADDR=$MASTER_IP
++[[ -z "$MASTER_ADDR" ]] && MASTER_ADDR=192.168.1.30
++
++pip install ftfy regex tqdm
++pip install git+https://github.com/openai/CLIP.git
++pip install -r requirements_remote.txt
++pip install imgaug
++
++#git clone https://github.com/NVIDIA/apex
++#cd apex
++#pip install -v --disable-pip-version-check --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./
++#cd ..
++
++
++echo 'download data...'
++SAS='?sv=2020-08-04&st=2022-02-15T10%3A59%3A38Z&se=2025-01-16T10%3A59%3A00Z&sr=c&sp=rl&sig=EtCWbXDcsez5BWX%2FAkh7irCn7tQ5wvkaRacYCXoyZRM%3D'
++wget -c https://azcopyvnext.azureedge.net/release20220721/azcopy_linux_amd64_10.16.0.tar.gz
++tar -xzvf azcopy_linux_amd64_10.16.0.tar.gz
++
++# 256 datasets
++azcopy_linux_amd64_10.16.0/azcopy copy 'https://wu2train.blob.core.windows.net/datasets/kinetics400_256'${SAS} ./ --recursive
++
++DATA_PATH=kinetics400_256/
++TRAIN_LIST=kinetics400_256/train.csv
++VAL_LIST=kinetics400_256/test.csv
++
++# 416 datasets
++#azcopy_linux_amd64_10.16.0/azcopy copy 'https://wu2train.blob.core.windows.net/datasets/kinetics400_416'${SAS} ./ --recursive
++#DATA_PATH=kinetics400_416/
++#TRAIN_LIST=kinetics400_416/train.csv
++#VAL_LIST=kinetics400_416/test.csv
++
++
++ln -Ts $AMLT_OUTPUT_DIR output
++
++CONFIG=$1
++PRETRAIN=$2
++FRAMEWORK=$3
++echo 'start running...'
++python -m torch.distributed.launch --nproc_per_node=${GPU_PER_NODE_COUNT} \
++                                   --node_rank=${NODE_RANK} \
++                                   --nnodes=${NODE_COUNT} \
++                                   --master_addr=${MASTER_ADDR} \
++                                   --master_port=${MASTER_PORT} \
++                                   main.py \
++                                   --config $CONFIG \
++                                   --backbone_path $PRETRAIN \
++                                   --framework $FRAMEWORK \
++                                   --output "output" \
++                                   --opt \
++                                   TRAIN.AUTO_RESUME True \
++                                   DATA.ROOT $DATA_PATH \
++                                   DATA.TRAIN_FILE $TRAIN_LIST \
++                                   DATA.VAL_FILE $VAL_LIST \
++                                   ${@:4}
+diff --git utils/visualize.py utils/visualize.py
+new file mode 100644
+index 0000000..e5a21ff
+--- /dev/null
++++ utils/visualize.py
+@@ -0,0 +1,258 @@
++from PIL import Image, ImageDraw
++import numpy as np
++import matplotlib
++import matplotlib.pyplot as plt
++import torch
++from torchvision import transforms
++import cv2
++def visualize_attn(attn_map):
++    return None
++
++def grid_show(to_shows, cols):
++    rows = (len(to_shows)-1) // cols + 1
++    it = iter(to_shows)
++    fig, axs = plt.subplots(rows, cols, figsize=(rows*8.5, cols*2))
++    for i in range(rows):
++        for j in range(cols):
++            try:
++                image, title = next(it)
++            except StopIteration:
++                image = np.zeros_like(to_shows[0][0])
++                title = 'pad'
++            axs[i, j].imshow(image)
++            axs[i, j].set_title(title)
++            axs[i, j].set_yticks([])
++            axs[i, j].set_xticks([])
++    plt.show()
++
++def visualize_head(att_map,idx,i):
++    att_map=att_map.permute(0,1,4,2,3)
++    att_map = torch.unbind(att_map, dim=0)
++    for id,xb in enumerate(att_map):
++        xs = torch.unbind(xb, dim=0)
++        for frame,x in enumerate(xs):
++            x=x.cpu().numpy()[0]
++            ax = plt.gca()
++            # Plot the heatmap
++            im = ax.imshow(x)
++            # Create colorbar
++            #cbar = ax.figure.colorbar(im, ax=ax)
++            #plt.show()
++            plt.savefig('output/{}_{}_batchid_{}_frame{}.jpg'.format(idx,i,id,frame))
++
++
++def visualize_heads(att_map, cols):
++    to_shows = []
++    att_map = att_map.squeeze()
++    for i in range(att_map.shape[0]):
++        to_shows.append((att_map[i], f'Head {i}'))
++    average_att_map = att_map.mean(axis=0)
++    to_shows.append((average_att_map, 'Head Average'))
++    grid_show(to_shows, cols=cols)
++
++
++def highlight_grid(image, grid_indexes, grid_size=14):
++    if not isinstance(grid_size, tuple):
++        grid_size = (grid_size, grid_size)
++
++    W, H = image.size
++    h = H / grid_size[0]
++    w = W / grid_size[1]
++    image = image.copy()
++    for grid_index in grid_indexes:
++        x, y = np.unravel_index(grid_index, (grid_size[0], grid_size[1]))
++        a = ImageDraw.ImageDraw(image)
++        a.rectangle([(y * w, x * h), (y * w + w, x * h + h)], fill=None, outline='red', width=2)
++    return image
++
++
++def visualize_grid_to_grid(att_map, grid_index, image, grid_size=14, alpha=0.6):
++    att_maps = torch.unbind(att_map.permute(0, 1, 4, 2, 3),dim=0)
++    images = torch.unbind(image, dim=0)
++    for i,att_mapv in enumerate(att_maps):
++        imagev=torch.unbind(images[i],dim=0)
++        att_mapv = torch.unbind(att_mapv, dim=0)
++        for j,frame in enumerate(att_mapv):
++            frame=frame.cpu().numpy()[0]
++            image=imagev[j].cpu().numpy()[0]
++            if not isinstance(grid_size, tuple):
++                grid_size = (grid_size, grid_size)
++
++            H, W = frame.shape
++            with_cls_token = False
++
++            grid_image = highlight_grid(image, [grid_index], grid_size)
++
++            mask = frame[grid_index].reshape(grid_size[0], grid_size[1])
++            mask = Image.fromarray(mask).resize((image.size))
++
++            fig, ax = plt.subplots(1, 2, figsize=(10, 7))
++            fig.tight_layout()
++
++            ax[0].imshow(grid_image)
++            ax[0].axis('off')
++
++            ax[1].imshow(grid_image)
++            ax[1].imshow(mask / np.max(mask), alpha=alpha, cmap='rainbow')
++            ax[1].axis('off')
++            plt.show()
++
++
++def cls_padding(image, mask, cls_weight, grid_size):
++    if not isinstance(grid_size, tuple):
++        grid_size = (grid_size, grid_size)
++
++    image = np.array(image)
++
++    H, W = image.shape[:2]
++    delta_H = int(H / grid_size[0])
++    delta_W = int(W / grid_size[1])
++
++    padding_w = delta_W
++    padding_h = H
++    padding = np.ones_like(image) * 255
++    padding = padding[:padding_h, :padding_w]
++
++    padded_image = np.hstack((padding, image))
++    padded_image = Image.fromarray(padded_image)
++    draw = ImageDraw.Draw(padded_image)
++    draw.text((int(delta_W / 4), int(delta_H / 4)), 'CLS', fill=(0, 0, 0))  # PIL.Image.size = (W,H) not (H,W)
++
++    mask = mask / max(np.max(mask), cls_weight)
++    cls_weight = cls_weight / max(np.max(mask), cls_weight)
++
++    if len(padding.shape) == 3:
++        padding = padding[:, :, 0]
++        padding[:, :] = np.min(mask)
++    mask_to_pad = np.ones((1, 1)) * cls_weight
++    mask_to_pad = Image.fromarray(mask_to_pad)
++    mask_to_pad = mask_to_pad.resize((delta_W, delta_H))
++    mask_to_pad = np.array(mask_to_pad)
++
++    padding[:delta_H, :delta_W] = mask_to_pad
++    padded_mask = np.hstack((padding, mask))
++    padded_mask = padded_mask
++
++    meta_mask = np.zeros((padded_mask.shape[0], padded_mask.shape[1], 4))
++    meta_mask[delta_H:, 0: delta_W, :] = 1
++
++    return padded_image, padded_mask, meta_mask
++
++
++def visualize_grid_to_grid_with_cls(att_map, grid_index, image, batch_idx,view,label,grid_size=14, alpha=0.3):
++    att_maps = torch.unbind(att_map.permute(0, 1, 4, 2, 3),dim=0) #B T h H W
++    images = torch.unbind(image, dim=0)
++    # for i,att_mapv in enumerate(att_maps):
++    #     imagev=torch.unbind(images[i],dim=0)
++    #     att_mapv = torch.unbind(att_mapv, dim=0)
++    #
++    #     fig, ax = plt.subplots(4, 4, figsize=(9,9))
++    #     fig.tight_layout()
++    #     for j,frame in enumerate(att_mapv):
++    #         frame=frame.cpu().numpy().mean(0) #head avg
++    #         image=imagev[j].cpu()
++    #         if not isinstance(grid_size, tuple):
++    #             grid_size = (grid_size, grid_size)
++    #
++    #         attention_map = frame[grid_index]
++    #         cls_weight = attention_map
++    #
++    #         mask = cls_weight.reshape(grid_size[0], grid_size[1])
++    #         mask = cv2.resize(mask,(224,224))
++    #         mask = mask / np.max(mask)
++    #         mask = (mask * 255).astype('uint8')
++    #         image =  image.permute(1,2,0) * torch.tensor([58.395, 57.12, 57.375]) /255.0 + torch.tensor([123.675, 116.28, 103.53])/255.0
++    #         image = image.permute(2,1,0)
++    #         image=transforms.ToPILImage()(image).convert('RGB').rotate(270).transpose( Image.FLIP_LEFT_RIGHT)
++    #         ax[int(j/4),int(j%4)].imshow(image,alpha=1)
++    #         ax[int(j / 4), int(j % 4)].axis('off')
++    #         ax[int(j/4),int(j%4)].imshow(mask, alpha=alpha, interpolation='nearest',cmap='jet')
++    #         ax[int(j/4),int(j%4)].axis('off')
++    #
++    #     plt.savefig('output2/grid{}__idx{}_in_batch{}_view_{}.jpg'.format(grid_index,i,batch_idx,view))
++    #     plt.close()
++    for i,att_mapv in enumerate(att_maps):
++        imagev=torch.unbind(images[i],dim=0)
++        att_mapv = torch.unbind(att_mapv, dim=0)
++
++        fig, ax = plt.subplots(4, 4, figsize=(9,9))
++        fig.tight_layout()
++        for j,frame in enumerate(att_mapv):
++            frame=frame.cpu().numpy().mean(0) #head avg
++            image=imagev[j].cpu()
++            if not isinstance(grid_size, tuple):
++                grid_size = (grid_size, grid_size)
++
++            attention_map = frame[grid_index+98]
++            cls_weight = attention_map
++
++            mask = cls_weight.reshape(grid_size[0], grid_size[1])
++            mask = cv2.resize(mask,(224,224))
++            mask = mask / np.max(mask)
++            mask = (mask * 255).astype('uint8')
++            image =  image.permute(1,2,0) * torch.tensor([58.395, 57.12, 57.375]) /255.0 + torch.tensor([123.675, 116.28, 103.53])/255.0
++            image = image.permute(2,1,0)
++            image=transforms.ToPILImage()(image).convert('RGB').rotate(270).transpose( Image.FLIP_LEFT_RIGHT)
++            ax[int(j/4),int(j%4)].imshow(image,alpha=1)
++            ax[int(j / 4), int(j % 4)].axis('off')
++            ax[int(j/4),int(j%4)].imshow(mask, alpha=alpha, interpolation='nearest',cmap='jet')
++            ax[int(j/4),int(j%4)].axis('off')
++
++        plt.savefig('../3d/{}_{}_{}_label{}_grid{}.jpg'.format(i,batch_idx,view,label[i],grid_index+98))
++        plt.close()
++
++def visualize_grid_to_grid_with_cls_th(att_map, grid_index, image, batch_idx,view,grid_size=14, alpha=0.3): # 2 14 224 224 12
++    att_maps = torch.unbind(att_map.permute(0, 1, 4, 2, 3),dim=0) #B T h H W
++    images = torch.unbind(image, dim=0)
++    for i,att_mapv in enumerate(att_maps):# 14 12 224 224
++        att_map = att_mapv.mean(1) # 14 224 224 # head avg
++        attention_maps = att_map[:,grid_index].reshape(14,16,14).softmax(dim=-1).permute(1,0,2).cpu().numpy() # 14 224
++        attention_maps= attention_maps.reshape(16,196)
++        #attention_maps = torch.unbind(attention_maps, dim=0)
++
++        imagev = torch.unbind(images[i], dim=0)
++        fig, ax = plt.subplots(4, 4, figsize=(9,9))
++        fig.tight_layout()
++        for j in range(16):
++            image=imagev[j].cpu()
++            if not isinstance(grid_size, tuple):
++                grid_size = (grid_size, grid_size)
++
++            cls_weight = attention_maps[j]
++
++            mask = cls_weight.reshape(grid_size[0], grid_size[1])
++            mask = cv2.resize(mask,(224,224))
++            mask = mask / np.max(mask)
++            mask = (mask * 255).astype('uint8')
++            image =  image.permute(1,2,0) * torch.tensor([58.395, 57.12, 57.375]) /255.0 + torch.tensor([123.675, 116.28, 103.53])/255.0
++            image = image.permute(2,1,0)
++            image=transforms.ToPILImage()(image).convert('RGB').rotate(270).transpose( Image.FLIP_LEFT_RIGHT)
++            ax[int(j/4),int(j%4)].imshow(image,alpha=1)
++            ax[int(j / 4), int(j % 4)].axis('off')
++            ax[int(j/4),int(j%4)].imshow(mask, alpha=alpha, interpolation='nearest',cmap='jet')
++            ax[int(j/4),int(j%4)].axis('off')
++
++        plt.savefig('output/TH_grid{}__idx{}_in_batch{}_view_{}.jpg'.format(grid_index,i,batch_idx,view))
++        plt.close()
++
++def visualize_data(image, idx,m,grid_size=14):
++    #image = image.permute(0, 2, 1, 3, 4)
++    images = torch.unbind(image, dim=0)
++    for i,imagev in enumerate(images):
++        imagev=torch.unbind(imagev, dim=0)
++        fig, ax = plt.subplots(4, 4, figsize=(10,10))
++        fig.tight_layout()
++        for j,frame in enumerate(imagev):
++            frame=frame.cpu()
++            if not isinstance(grid_size, tuple):
++                grid_size = (grid_size, grid_size)
++
++            frame =  frame.permute(1,2,0) * torch.tensor([58.395, 57.12, 57.375]) /255.0 + torch.tensor([123.675, 116.28, 103.53])/255.0
++            frame = frame.permute(2,1,0)
++            frame=transforms.ToPILImage()(frame).convert('RGB').rotate(270)
++
++            ax[int(j/4),int(j%4)].imshow(frame,alpha=1)
++            ax[int(j / 4), int(j % 4)].axis('off')
++
++        plt.savefig('output/{}_idx{}_i_{}.jpg'.format(i,idx,m))
++        plt.close()
+\ No newline at end of file
+diff --git yc_submit/2ds_v3_test.yaml yc_submit/2ds_v3_test.yaml
+new file mode 100644
+index 0000000..e39d354
+--- /dev/null
++++ yc_submit/2ds_v3_test.yaml
+@@ -0,0 +1,49 @@
++description: A2
++# lr1e5 tlr1e3
++target:
++   service: amlk8s
++   name: itphyperdgx2cl1
++   vc: hai1
++
++
++environment:
++  image: tangchuanxin/slowfast:deepspeed
++  registry: docker.io
++  username: wenyuqing
++  image_setup:
++    - pip install pathlib ftfy termcolor regex pandas
++    - pip install mmcv-full
++#    - git clone https://github.com/NVIDIA/apex
++#      cd apex
++#      pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./
++#      cd ..
++
++
++storage:
++  data:
++    storage_account_name: wu2train
++    container_name: datasets
++  model:
++    storage_account_name: wu2train
++    container_name: v-yuczhao
++
++code:
++  code_upload: True
++  local_dir: $CONFIG_DIR/../
++
++jobs:
++  - name: A3
++    sku: 32G16-V100
++#    process_count_per_node: 1
++#    mpi: true
++    command:
++      - bash tools/train_k400.sh configs/k400/16_32_T2D_tp1.yaml /mnt/model/clip_models/ViT-B-16.pt 2DSCLS12P
++        TRAIN.BATCH_SIZE 8 TRAIN.ACCUMULATION_STEPS 2 TRAIN.LR 8e-6 T2D.USE_TEXT_CLASSIFIER True
++        T2D.TEMPORAL_MODEL transformer TRAIN.AMP torch SAVE_NUM 2 T2D.USE_CLS_TOKEN True
++     # - sleep infinity
++    submit_args:
++      container_args:
++        shm_size: 512g
++    sla_tier: basic    # Default: basic
++    execution_mode: basic  # Default: basic
++    priority: high  # Default: medium
+\ No newline at end of file
+diff --git yuqing_submit/Q2ds_v3_2node.yaml yuqing_submit/Q2ds_v3_2node.yaml
+new file mode 100644
+index 0000000..8e0e500
+--- /dev/null
++++ yuqing_submit/Q2ds_v3_2node.yaml
+@@ -0,0 +1,54 @@
++description: A2
++# lr1e5 tlr1e3
++target:
++   service: amlk8s
++#   name: a100-80gb-wus3
++#   vc: TuringMM
++
++   name: itplabrr1cl1
++   vc:  resrchvc
++
++
++environment:
++  image: tangchuanxin/slowfast:deepspeed
++  registry: docker.io
++  username: wenyuqing
++  image_setup:
++    - pip install pathlib ftfy termcolor regex pandas
++    - pip install mmcv-full
++#    - git clone https://github.com/NVIDIA/apex
++#      cd apex
++#      pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./
++#      cd ..
++
++
++storage:
++  data:
++    storage_account_name: wu2train
++    container_name: datasets
++  model:
++    storage_account_name: wu2train
++    container_name: v-yuczhao
++
++code:
++  code_upload: True
++  local_dir: $CONFIG_DIR/../
++
++jobs:
++  - name: A3
++    sku: 2x32G8-V100-IB
++    process_count_per_node: 1
++    mpi: true
++    command:
++      - export NCCL_IB_DISABLE=1
++      - export NCCL_P2P_LEVEL=NVL
++      - bash tools/train_k400.sh configs/k400/16_32_T2D_tp1.yaml /mnt/model/clip_models/ViT-B-16.pt 2DS
++        TRAIN.BATCH_SIZE 8 TRAIN.ACCUMULATION_STEPS 2 TRAIN.LR 1e-5 T2D.USE_TEXT_CLASSIFIER True
++        T2D.TEMPORAL_MODEL transformer TRAIN.AMP torch SAVE_NUM 2
++     # - sleep infinity
++    submit_args:
++      container_args:
++        shm_size: 512g
++    sla_tier: basic    # Default: basic
++    execution_mode: basic  # Default: basic
++    priority: high  # Default: medium
+\ No newline at end of file
+diff --git yuqing_submit/Q2ds_v3_8gpu.yaml yuqing_submit/Q2ds_v3_8gpu.yaml
+new file mode 100644
+index 0000000..cb04201
+--- /dev/null
++++ yuqing_submit/Q2ds_v3_8gpu.yaml
+@@ -0,0 +1,49 @@
++description: A2
++# lr1e5 tlr1e3
++target:
++   service: amlk8s
++   name: itplabrr1cl1
++   vc: resrchvc
++
++
++environment:
++  image: tangchuanxin/slowfast:deepspeed
++  registry: docker.io
++  username: wenyuqing
++  image_setup:
++    - pip install pathlib ftfy termcolor regex pandas
++    - pip install mmcv-full
++#    - git clone https://github.com/NVIDIA/apex
++#      cd apex
++#      pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./
++#      cd ..
++
++
++storage:
++  data:
++    storage_account_name: wu2train
++    container_name: datasets
++  model:
++    storage_account_name: wu2train
++    container_name: v-yuczhao
++
++code:
++  code_upload: True
++  local_dir: $CONFIG_DIR/../
++
++jobs:
++  - name: A3
++    sku: 32G8-V100
++#    process_count_per_node: 1
++#    mpi: true
++    command:
++      - bash tools/train_k400.sh configs/k400/16_32_T2D_tp1.yaml /mnt/model/clip_models/ViT-B-16.pt 2DS
++        TRAIN.BATCH_SIZE 8 TRAIN.ACCUMULATION_STEPS 4 TRAIN.LR 1e-5 T2D.USE_TEXT_CLASSIFIER True
++        T2D.TEMPORAL_MODEL transformer TRAIN.AMP torch SAVE_NUM 2
++     # - sleep infinity
++    submit_args:
++      container_args:
++        shm_size: 512g
++    sla_tier: basic    # Default: basic
++    execution_mode: basic  # Default: basic
++    priority: high  # Default: medium
+\ No newline at end of file

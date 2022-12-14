@@ -1,0 +1,338 @@
+diff --git acc_curve.py acc_curve.py
+index 5cb322e..fa5ff8f 100644
+--- acc_curve.py
++++ acc_curve.py
+@@ -3,8 +3,8 @@ import re
+ import matplotlib.pyplot as plt
+ import os.path as osp
+ 
+-fullpath = osp.abspath('./logs/2dsl.txt')
+-fullpath2 = osp.abspath('./logs/2dsv3.txt')
++fullpath = osp.abspath('./logs/2ds_add.txt')
++fullpath2 = osp.abspath('./logs/2d_cls.txt')
+ # mode = {'Loss'}
+ mode = {'Loss'}
+ 
+@@ -67,7 +67,7 @@ pngName = filename.split('.')[0]
+ if mode == {'Loss'}:
+     plt.plot(x, Loss, color='red', marker='o', linewidth=0.5, markersize=1)
+     plt.plot(y, Loss2, color='green', marker='o', linewidth=0.5, markersize=1)
+-    plt.legend(labels=('2dsl','v3'))
++    plt.legend(labels=('2ds_add','2d_cls'))
+ elif mode == {'Loss', 'CLoss', 'TLoss'}:
+     plt.plot(x, Loss, color='red', marker='o', linestyle='dashed', linewidth=2, markersize=1)
+     # plt.plot(x, CLoss, color='green', marker='o', linestyle='dashed', linewidth=2, markersize=1)
+diff --git datasets/build.py datasets/build.py
+index 01178c3..64f2723 100644
+--- datasets/build.py
++++ datasets/build.py
+@@ -410,6 +410,7 @@ def build_dataloader(logger, config):
+     val_data = VideoDataset(ann_file=config.DATA.VAL_FILE, data_prefix=config.DATA.ROOT, labels_file=config.DATA.LABEL_LIST, pipeline=val_pipeline)
+     indices = np.arange(dist.get_rank(), len(val_data), dist.get_world_size())
+     sampler_val = SubsetRandomSampler(indices)
++    #sampler_val = list(range(dist.get_rank(), len(val_data), dist.get_world_size()))
+     val_loader = DataLoader(
+         val_data, sampler=sampler_val,
+         batch_size=2,
+diff --git loss_curve.py loss_curve.py
+index b695f4f..6d39369 100644
+--- loss_curve.py
++++ loss_curve.py
+@@ -3,8 +3,8 @@ import re
+ import matplotlib.pyplot as plt
+ import os.path as osp
+ 
+-fullpath = osp.abspath('./logs/2dsl.txt')
+-fullpath2 = osp.abspath('./logs/2dsv3.txt')
++fullpath = osp.abspath('./logs/2ds_add.txt')
++fullpath2 = osp.abspath('./logs/2d_cls.txt')
+ # mode = {'Loss'}
+ mode = {'Loss'}
+ 
+@@ -61,7 +61,7 @@ if mode == {'Loss'}:
+     print(x,"111",Loss,"222",y,"333",Loss2)
+     plt.plot(x, Loss, color='red', marker='o', linewidth=0.5, markersize=1)
+     plt.plot(y, Loss2, color='green', marker='o', linewidth=0.5, markersize=1)
+-    plt.legend(labels=('2dsl','v3'))
++    plt.legend(labels=('2ds_add','2d_cls'))
+ elif mode == {'Loss', 'CLoss', 'TLoss'}:
+     plt.plot(x, Loss, color='red', marker='o', linestyle='dashed', linewidth=2, markersize=1)
+     # plt.plot(x, CLoss, color='green', marker='o', linestyle='dashed', linewidth=2, markersize=1)
+diff --git main.py main.py
+index b61e68b..0b8ff51 100644
+--- main.py
++++ main.py
+@@ -13,6 +13,7 @@ from utils.custom_optimizer import build_optimizer_t2d, T2D_LR_CONFIG, EVL_LR_CO
+ from utils.tools import AverageMeter, reduce_tensor, epoch_saving, load_checkpoint, generate_text, auto_resume_helper
+ from datasets.build import build_dataloader
+ from utils.logger import create_logger
++from utils.visualize import visualize_grid_to_grid_with_cls
+ import time
+ import numpy as np
+ import random
+@@ -51,6 +52,7 @@ def parse_option():
+     parser.add_argument('--only_test', action='store_true')
+     parser.add_argument('--batch-size', type=int)
+     parser.add_argument('--accumulation-steps', type=int)
++    parser.add_argument('--visualize', action='store_true')
+ 
+     parser.add_argument('--framework', default='XCLIP', type=str)
+     parser.add_argument('--backbone_path', type=str)
+@@ -166,6 +168,7 @@ def main(config, args):
+                         imagenet_pretrain=config.T2D.IMAGENET_PRETRAIN,
+                         batch_mode=config.T2DS.BATCH_MODE,
+                         use_cls_token=config.T2D.USE_CLS_TOKEN,
++                        #visualize=args.visualize,
+                            )
+     elif args.framework == '2DSCLS12P':
+         model = CLIP2DSCLS12P(num_classes=config.DATA.NUM_CLASSES,
+@@ -336,6 +339,7 @@ def main(config, args):
+         acc1 = validate(val_loader, text_labels, model, config)
+         logger.info(f"Accuracy of the network on the {len(val_data)} test videos: {acc1:.1f}%")
+         return
++    assert (not args.visualize)
+ 
+     for epoch in range(start_epoch, config.TRAIN.EPOCHS):
+         train_loader.sampler.set_epoch(epoch)
+@@ -468,8 +472,11 @@ def validate(val_loader, text_labels, model, config):
+ 
+                 if config.TRAIN.OPT_LEVEL == 'O2':
+                     image_input = image_input.half()
+-
+-                output = model(image_input, text_inputs)
++                if args.visualize:
++                    output,attn = model(image_input, text_inputs)
++                    visualize_grid_to_grid_with_cls(attn,0,image_input,batch_idx=idx,view=i,label=label_id) # attn_map shold be (B T H W head) 2 16 198 198 12
++                else:
++                    output = model(image_input, text_inputs)
+ 
+                 similarity = output.view(b, -1).softmax(dim=-1)
+                 tot_similarity += similarity
+diff --git models/model_2d_stream.py models/model_2d_stream.py
+index eee1335..d561bfb 100644
+--- models/model_2d_stream.py
++++ models/model_2d_stream.py
+@@ -310,11 +310,14 @@ class CLIP2DS(nn.Module):
+ 
+ 
+         self.prompts_embedding = nn.Parameter(scale * torch.randn(1, 4, width))
+-        self.prompts_pos = nn.Parameter(scale * torch.randn(1, 4 * 2, width))
+-        self.prompts_init_out = nn.Parameter(scale * torch.randn(1, 4, width))
++        self.prompts_pos = nn.Parameter(scale * torch.randn(1, 12, width))
++        self.prompts_init_out = nn.Parameter(scale * torch.randn(1, 8, width))
+ 
+-        self.prompts_projection = nn.Sequential(nn.Linear(width, width, bias=False),
++        self.prompts_projection1 = nn.Sequential(nn.Linear(width, width, bias=False),
+                                                 nn.LayerNorm(width))
++        self.prompts_projection2 = nn.Sequential(nn.Linear(width, width, bias=False),
++                                                nn.LayerNorm(width))
++        print("lltv2!!!!!")
+         self.ln_pre = LayerNorm(width)
+         self.transformer = Transformer(width, layers, heads, 'full', enable_checkpoint)
+         self.ln_post = LayerNorm(width)
+@@ -398,14 +401,18 @@ class CLIP2DS(nn.Module):
+         x = self.ln_pre(x)
+ 
+         outs = []
++        ins = []
+         prompts_in = self.prompts_embedding + torch.zeros(B, 1, 1, device=x.device)
+         prompts_out = self.prompts_init_out + torch.zeros(B, 1, 1, device=x.device)
+         for i in range(T):
+             prompts = torch.cat([prompts_in, prompts_out], dim=1) + self.prompts_pos
+             out = self.transformer(torch.cat([prompts, x[i]], dim=1), size)
+-            prompts_out = self.prompts_projection(out[:, :4])
+-            # outs.append(out[:, 8:].mean(dim=1))
+-            outs.append(out[:, 4:8].mean(dim=1))
++            ins.append(out[:, :4].detach())
++            avg_in = torch.stack(ins, dim=1).mean(dim=1)
++            prompts_out[:,:4] = self.prompts_projection1(avg_in)
++            prompts_out[:, 4:] = self.prompts_projection2(out[:, :4])
++            outs.append(out[:, 12:].mean(dim=1))
++            #outs.append(out[:, 8:12].mean(dim=1))
+         x = torch.stack(outs, dim=1)  # b t c
+ 
+         x = self.ln_post(x)
+diff --git tools/Qtrain_k400.sh tools/Qtrain_k400.sh
+index 014daa7..93ec29c 100644
+--- tools/Qtrain_k400.sh
++++ tools/Qtrain_k400.sh
+@@ -61,3 +61,21 @@ python -m torch.distributed.launch --nproc_per_node=${GPU_PER_NODE_COUNT} \
+                                    DATA.TRAIN_FILE $TRAIN_LIST \
+                                    DATA.VAL_FILE $VAL_LIST \
+                                    ${@:4}
++echo 'Finished!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!...'
++python -m torch.distributed.launch --nproc_per_node=${GPU_PER_NODE_COUNT} \
++                                   --node_rank=${NODE_RANK} \
++                                   --nnodes=${NODE_COUNT} \
++                                   --master_addr=${MASTER_ADDR} \
++                                   --master_port=${MASTER_PORT} \
++                                   main.py \
++                                   --config $CONFIG \
++                                   --backbone_path $PRETRAIN \
++                                   --framework $FRAMEWORK \
++                                   --output "output/expQ" \
++                                   --opt \
++                                   TRAIN.AUTO_RESUME True \
++                                   TRAIN.EPOCHS 150 \
++                                   DATA.ROOT $DATA_PATH \
++                                   DATA.TRAIN_FILE $TRAIN_LIST \
++                                   DATA.VAL_FILE $VAL_LIST \
++                                   ${@:4}
+diff --git utils/custom_optimizer.py utils/custom_optimizer.py
+index 7d6369f..b85b530 100644
+--- utils/custom_optimizer.py
++++ utils/custom_optimizer.py
+@@ -5,7 +5,7 @@ import torch.optim as optim
+ 
+ 
+ T2D_LR_CONFIG = [
+-    ('_t', 100), ('prompts_', 100), ('head', 100)
++    ('_t', 125), ('prompts_', 125), ('head', 125)
+ ]
+ 
+ EVL_LR_CONFIG = [
+diff --git utils/visualize.py utils/visualize.py
+index e5a21ff..3b5fe19 100644
+--- utils/visualize.py
++++ utils/visualize.py
+@@ -183,7 +183,7 @@ def visualize_grid_to_grid_with_cls(att_map, grid_index, image, batch_idx,view,l
+             if not isinstance(grid_size, tuple):
+                 grid_size = (grid_size, grid_size)
+ 
+-            attention_map = frame[grid_index+98]
++            attention_map = frame[grid_index+5,9:]
+             cls_weight = attention_map
+ 
+             mask = cls_weight.reshape(grid_size[0], grid_size[1])
+@@ -198,7 +198,7 @@ def visualize_grid_to_grid_with_cls(att_map, grid_index, image, batch_idx,view,l
+             ax[int(j/4),int(j%4)].imshow(mask, alpha=alpha, interpolation='nearest',cmap='jet')
+             ax[int(j/4),int(j%4)].axis('off')
+ 
+-        plt.savefig('../3d/{}_{}_{}_label{}_grid{}.jpg'.format(i,batch_idx,view,label[i],grid_index+98))
++        plt.savefig('2dscls_out2/{}_{}_{}_label{}_grid{}.jpg'.format(i,batch_idx,view,label[i],grid_index+98))
+         plt.close()
+ 
+ def visualize_grid_to_grid_with_cls_th(att_map, grid_index, image, batch_idx,view,grid_size=14, alpha=0.3): # 2 14 224 224 12
+diff --git yc_submit/2d.yaml yc_submit/2d.yaml
+index 9b5d34a..218e98b 100644
+--- yc_submit/2d.yaml
++++ yc_submit/2d.yaml
+@@ -39,7 +39,7 @@ jobs:
+     command:
+       - bash tools/train_k400.sh configs/k400/16_32_T2D_tp1.yaml /mnt/model/clip_models/ViT-B-16.pt T2D
+         TRAIN.BATCH_SIZE 8 TRAIN.ACCUMULATION_STEPS 2 TRAIN.LR 1e-5 T2D.USE_TEXT_CLASSIFIER True
+-        T2D.TEMPORAL_MODEL transformer TRAIN.AMP torch SAVE_NUM 2 T2D.USE_CLS_TOKEN True T2D.ATTN_TYPE 2d
++        T2D.TEMPORAL_MODEL transformer TRAIN.AMP torch SAVE_NUM 2 T2D.USE_CLS_TOKEN True T2D.ATTN_TYPE 2d T2D.TEMPORAL_LAYER 1
+      # - sleep infinity
+     submit_args:
+       container_args:
+diff --git yc_submit/2ds_v3.yaml yc_submit/2ds_v3.yaml
+index eec1a09..e31ede8 100644
+--- yc_submit/2ds_v3.yaml
++++ yc_submit/2ds_v3.yaml
+@@ -38,7 +38,7 @@ jobs:
+ #    mpi: true
+     command:
+       - bash tools/train_k400.sh configs/k400/16_32_T2D_tp1.yaml /mnt/model/clip_models/ViT-B-16.pt 2DSCLS
+-        TRAIN.BATCH_SIZE 8 TRAIN.ACCUMULATION_STEPS 2 TRAIN.LR 1e-5 T2D.USE_TEXT_CLASSIFIER True
++        TRAIN.BATCH_SIZE 8 TRAIN.ACCUMULATION_STEPS 2 TRAIN.LR 8e-6 T2D.USE_TEXT_CLASSIFIER True
+         T2D.TEMPORAL_MODEL transformer TRAIN.AMP torch SAVE_NUM 2 T2D.USE_CLS_TOKEN True
+      # - sleep infinity
+     submit_args:
+diff --git yc_submit/2ds_v3_test.yaml yc_submit/2ds_v3_test.yaml
+index e39d354..0687fc8 100644
+--- yc_submit/2ds_v3_test.yaml
++++ yc_submit/2ds_v3_test.yaml
+@@ -2,8 +2,8 @@ description: A2
+ # lr1e5 tlr1e3
+ target:
+    service: amlk8s
+-   name: itphyperdgx2cl1
+-   vc: hai1
++   name: g-v100-8x-eus-1
++   vc: MS-Shared
+ 
+ 
+ environment:
+@@ -33,13 +33,13 @@ code:
+ 
+ jobs:
+   - name: A3
+-    sku: 32G16-V100
++    sku: 32G8-V100
+ #    process_count_per_node: 1
+ #    mpi: true
+     command:
+       - bash tools/train_k400.sh configs/k400/16_32_T2D_tp1.yaml /mnt/model/clip_models/ViT-B-16.pt 2DSCLS12P
+         TRAIN.BATCH_SIZE 8 TRAIN.ACCUMULATION_STEPS 2 TRAIN.LR 8e-6 T2D.USE_TEXT_CLASSIFIER True
+-        T2D.TEMPORAL_MODEL transformer TRAIN.AMP torch SAVE_NUM 2 T2D.USE_CLS_TOKEN True
++        T2D.TEMPORAL_MODEL transformer TRAIN.AMP torch SAVE_NUM 2 T2D.USE_CLS_TOKEN True TEST.ONLY_TEST True
+      # - sleep infinity
+     submit_args:
+       container_args:
+diff --git yuqing_submit/2ds_v3_2node.yaml yuqing_submit/2ds_v3_2node.yaml
+index 8e0e500..b64c435 100644
+--- yuqing_submit/2ds_v3_2node.yaml
++++ yuqing_submit/2ds_v3_2node.yaml
+@@ -42,9 +42,9 @@ jobs:
+     command:
+       - export NCCL_IB_DISABLE=1
+       - export NCCL_P2P_LEVEL=NVL
+-      - bash tools/train_k400.sh configs/k400/16_32_T2D_tp1.yaml /mnt/model/clip_models/ViT-B-16.pt 2DS
+-        TRAIN.BATCH_SIZE 8 TRAIN.ACCUMULATION_STEPS 2 TRAIN.LR 1e-5 T2D.USE_TEXT_CLASSIFIER True
+-        T2D.TEMPORAL_MODEL transformer TRAIN.AMP torch SAVE_NUM 2
++      - bash tools/train_k400.sh configs/k400/16_32_T2D_tp1.yaml /mnt/model/clip_models/ViT-B-16.pt 2DSCLS12P
++        TRAIN.BATCH_SIZE 4 TRAIN.ACCUMULATION_STEPS 4 TRAIN.LR 8e-6 T2D.USE_TEXT_CLASSIFIER True
++        T2D.TEMPORAL_MODEL transformer TRAIN.AMP torch SAVE_NUM 2 T2D.USE_CLS_TOKEN True
+      # - sleep infinity
+     submit_args:
+       container_args:
+diff --git yuqing_submit/Q2ds_v3_2node.yaml yuqing_submit/Q2ds_v3_2node.yaml
+index 8e0e500..f8aed6b 100644
+--- yuqing_submit/Q2ds_v3_2node.yaml
++++ yuqing_submit/Q2ds_v3_2node.yaml
+@@ -42,9 +42,9 @@ jobs:
+     command:
+       - export NCCL_IB_DISABLE=1
+       - export NCCL_P2P_LEVEL=NVL
+-      - bash tools/train_k400.sh configs/k400/16_32_T2D_tp1.yaml /mnt/model/clip_models/ViT-B-16.pt 2DS
++      - bash tools/Qtrain_k400.sh configs/k400/16_32_T2D_tp1.yaml /mnt/model/clip_models/ViT-B-16.pt 2DSCLS
+         TRAIN.BATCH_SIZE 8 TRAIN.ACCUMULATION_STEPS 2 TRAIN.LR 1e-5 T2D.USE_TEXT_CLASSIFIER True
+-        T2D.TEMPORAL_MODEL transformer TRAIN.AMP torch SAVE_NUM 2
++        T2D.TEMPORAL_MODEL transformer TRAIN.AMP torch SAVE_NUM 2 T2D.USE_CLS_TOKEN True
+      # - sleep infinity
+     submit_args:
+       container_args:
+diff --git yuqing_submit/Q2ds_v3_8gpu.yaml yuqing_submit/Q2ds_v3_8gpu.yaml
+index cb04201..ae37825 100644
+--- yuqing_submit/Q2ds_v3_8gpu.yaml
++++ yuqing_submit/Q2ds_v3_8gpu.yaml
+@@ -1,9 +1,9 @@
+ description: A2
+ # lr1e5 tlr1e3
+ target:
+-   service: amlk8s
+-   name: itplabrr1cl1
+-   vc: resrchvc
++   service: sing
++   name: msroctovc
++   #vc: resrchvc
+ 
+ 
+ environment:
+@@ -33,12 +33,12 @@ code:
+ 
+ jobs:
+   - name: A3
+-    sku: 32G8-V100
++    sku: 16G8-V100
+ #    process_count_per_node: 1
+ #    mpi: true
+     command:
+-      - bash tools/train_k400.sh configs/k400/16_32_T2D_tp1.yaml /mnt/model/clip_models/ViT-B-16.pt 2DS
+-        TRAIN.BATCH_SIZE 8 TRAIN.ACCUMULATION_STEPS 4 TRAIN.LR 1e-5 T2D.USE_TEXT_CLASSIFIER True
++      - bash tools/Qtrain_k400.sh configs/k400/16_32_T2D_tp1.yaml /mnt/model/clip_models/ViT-B-16.pt 2DS
++        TRAIN.BATCH_SIZE 4 TRAIN.ACCUMULATION_STEPS 8 TRAIN.LR 1e-5 T2D.USE_TEXT_CLASSIFIER True
+         T2D.TEMPORAL_MODEL transformer TRAIN.AMP torch SAVE_NUM 2
+      # - sleep infinity
+     submit_args:
