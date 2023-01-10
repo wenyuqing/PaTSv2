@@ -15,8 +15,7 @@ import clip
 from .prompt import VideoSpecificPrompt
 
 from .k400_class import K400_CLASS
-from .k600_class import K600_CLASS
-from visualize import visualize_heads,visualize_heads_avg
+
 
 SINGLE_PROMPT = ["a video of a person {}."]
 
@@ -160,7 +159,6 @@ class QuickGELU(nn.Module):
         return x * torch.sigmoid(1.702 * x)
 
 
-
 class Attention(nn.Module):
     def __init__(self,
                  embed_dim,
@@ -184,34 +182,30 @@ class Attention(nn.Module):
         constant_(self.in_proj_bias, 0.)
         constant_(self.out_proj.bias, 0.)
 
-    def attention(self, q, k, v, i,T,mask=None):
+    def attention(self, q, k, v, mask=None):
         attn = (q @ k.transpose(-2, -1))
         if mask is not None:
             attn = attn.masked_fill(mask, -1e3)
         attn = attn.softmax(-1)
-        # torch.save(attn, "attnmaps/attn.pt")
-        # y = torch.load("attnmaps/attn.pt")
-        if i==11:
-            visualize_heads_avg(attn[:1].cpu(),T,cols=4)
         o = (attn @ v)
         return o
 
-    def _forward_in_frame(self, x,i,T):
+    def _forward_in_frame(self, x):
         x = F.linear(x, self.in_proj_weight, self.in_proj_bias)
         qkv = rearrange(x, 'b n (three num_heads head_c) -> three b num_heads n head_c',
                         three=3, num_heads=self.num_heads)
         q, k, v = qkv.unbind(0)
         q = q * self.scale
 
-        x = self.attention(q, k, v,i,T)
+        x = self.attention(q, k, v)
 
         x = rearrange(x, 'b num_heads n head_c -> b n (num_heads head_c)')
         x = self.out_proj(x)
         return x
 
-    def forward(self, x, size,i,T):
+    def forward(self, x, size):
         """[B N C]"""
-        x = self._forward_in_frame(x,i,T)
+        x = self._forward_in_frame(x)
 
         return x
 
@@ -229,8 +223,8 @@ class ResidualAttentionBlock(nn.Module):
         ]))
         self.ln_2 = LayerNorm(d_model)
 
-    def forward(self, x: torch.Tensor, size,i,T):
-        x = x + self.attn(self.ln_1(x), size,i,T)
+    def forward(self, x: torch.Tensor, size):
+        x = x + self.attn(self.ln_1(x), size)
         x = x + self.mlp(self.ln_2(x))
         return x, size
 
@@ -286,28 +280,28 @@ class TransformerL(nn.Module):
         self.resblocks = nn.ModuleList([ResidualAttentionBlock(width, heads, attn_type) for _ in range(layers)])
         self.enable_checkpoint = enable_checkpoint
 
-    def forward(self, x: torch.Tensor, size,prompts_in,prompts_outs,T,prompts_pos):
+    def forward(self, x: torch.Tensor, size,prompts_in,T,prompts_pos):
         checkpoint_segment = 2
         if self.enable_checkpoint:
             x, size = sequential_checkpoint(self.resblocks, checkpoint_segment, x, size)
             return x
         else:
             if T == 0:
-                prompts = torch.cat([prompts_outs, prompts_in], dim=1) + prompts_pos
+                prompts = prompts_in + prompts_pos
                 x = torch.cat([prompts, x], dim=1)
                 for i, blk in enumerate(self.resblocks):
-                    x, size = blk(x, size,i,T)
+                    x, size = blk(x, size)
             else:
                 for i,blk in enumerate(self.resblocks):
                     if i == 0:
-                        prompts = torch.cat([prompts_outs[:,:,i],prompts_in], dim=1) + prompts_pos
+                        prompts = prompts_in[:,:,i] + prompts_pos
                         x = torch.cat([prompts, x], dim=1)
                     else:
-                        x[:, :4]= 0.5 * prompts_outs[:,:,i]  + 0.5 * x[:,:4]
-                    x,size = blk(x,size,i,T)
+                        x[:, :4]= 0.5 * prompts_in[:,:,i]  + 0.5 * x[:,:4]
+                    x,size = blk(x,size)
             return x
 
-class CLIP2DSCLS12P(nn.Module):
+class CLIP2DSCLS12PONE(nn.Module):
     def __init__(self,
                  num_classes=400,
                  width=768,
@@ -344,15 +338,15 @@ class CLIP2DSCLS12P(nn.Module):
         scale = width ** -0.5
         self.use_cls_token = use_cls_token
         if self.use_cls_token:
-            print("!!!!!use cls token   12pppp!!!!")
+            print("!!!!!use cls token   12pppp onep!!!!")
             self.class_embedding = nn.Parameter(scale * torch.randn(width))
         self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size[1]) ** 2 +
                                                                      (1 if self.use_cls_token else 0), width))
 
 
         self.prompts_embedding = nn.Parameter(scale * torch.randn(1, 4, width))
-        self.prompts_pos = nn.Parameter(scale * torch.randn(1, 4 * 2, width))
-        self.prompts_init_out = nn.Parameter(scale * torch.randn(1, 4, width))
+        self.prompts_pos = nn.Parameter(scale * torch.randn(1, 4 , width))
+        #self.prompts_init_out = nn.Parameter(scale * torch.randn(1, 4, width))
 
         self.prompts_projection = nn.Linear(width, width * layers, bias=False)
         self.prompts_projection_ln = nn.ModuleList([nn.LayerNorm(width) for _ in range(layers)])
@@ -389,7 +383,7 @@ class CLIP2DSCLS12P(nn.Module):
         nn.init.normal_(self.positional_embedding, std=0.02)
         nn.init.normal_(self.prompts_embedding, std=0.02)
         nn.init.normal_(self.prompts_pos, std=0.02)
-        nn.init.normal_(self.prompts_init_out, std=0.02)
+        #nn.init.normal_(self.prompts_init_out, std=0.02)
         if self.temporal_model == 'transformer':
             nn.init.normal_(self.model_t_pos, std=0.02)
         if self.use_cls_token:
@@ -443,19 +437,19 @@ class CLIP2DSCLS12P(nn.Module):
 
         outs = []
         prompts_in = self.prompts_embedding + torch.zeros(B, 1, 1, device=x.device)
-        prompts_out = self.prompts_init_out + torch.zeros(B, 1, 1, device=x.device)
+        #prompts_out = self.prompts_init_out + torch.zeros(B, 1, 1, device=x.device)
         for i in range(T):
             prompts_outs = []
-            out = self.transformer(x[i],size,prompts_in,prompts_out,i,self.prompts_pos)
-            proj_out = rearrange(self.prompts_projection(out[:, 4:8]), 'b n (layers c) -> b n layers c', layers=12)
+            out = self.transformer(x[i],size,prompts_in,i,self.prompts_pos)
+            proj_out = rearrange(self.prompts_projection(out[:, 0:4]), 'b n (layers c) -> b n layers c', layers=12)
             for i,ln in enumerate(self.prompts_projection_ln):
                 pout = ln(proj_out[:,:,i])
                 prompts_outs.append(pout)
-            prompts_out = torch.stack(prompts_outs,dim=2)
+            prompts_in = torch.stack(prompts_outs,dim=2)
             if self.use_cls_token:
-                outs.append(out[:, 8])
+                outs.append(out[:, 4])
             else:
-                outs.append(out[:, 4:8].mean(dim=1))
+                outs.append(out[:, 0:4].mean(dim=1))
         x = torch.stack(outs, dim=1)  # b t c
 
         x = self.ln_post(x)

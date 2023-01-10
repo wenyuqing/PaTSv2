@@ -13,7 +13,7 @@
         <remote-mappings server-id="python@sftp://FAREAST.v-wenyuqing@GCRSANDBOX224.redmond.corp.microsoft.com:22/home/v-wenyuqing/anaconda3/envs/xclip/bin/python3.8">
           <settings>
             <list>
-              <mapping local-root="$PROJECT_DIR$" remote-root="/home/v-wenyuqing/code/Pats/yc_v3" />
+              <mapping local-root="$PROJECT_DIR$" remote-root="/home/v-wenyuqing/code/PaTSv2" />
             </list>
           </settings>
         </remote-mappings>

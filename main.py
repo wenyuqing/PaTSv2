@@ -37,6 +37,11 @@ from models.model_2d_stream12p import CLIP2DSL
 from models.model_2d_stream_lowlevel import CLIP2DSLow
 from models.model_2d_stream_cls import CLIP2DSCLS
 from models.model_2d_stream_cls_12p import CLIP2DSCLS12P
+from models.model_2d_stream_cls_12p_onep import CLIP2DSCLS12PONE
+from models.model_2d_stream_cls_12p_causal import CLIP2DSCLS12PCA
+from models.model_2d_stream_cls_12p_causal_v2 import CLIP2DSCLS12PCAV2
+from models.model_2d_stream_cls_12p_causalv3 import CLIP2DSCLS12PCAV3
+from models.model_2d_stream_cls_12p_causalv4 import CLIP2DSCLS12PCAV4
 def parse_option():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', '-cfg', required=True, type=str, default='configs/k400/32_8.yaml')
@@ -56,7 +61,7 @@ def parse_option():
 
     parser.add_argument('--framework', default='XCLIP', type=str)
     parser.add_argument('--backbone_path', type=str)
-
+    parser.add_argument('--pretrain16', type=str)
     parser.add_argument("--local_rank", type=int, default=-1, help='local rank for DistributedDataParallel')
     args = parser.parse_args()
 
@@ -191,6 +196,111 @@ def main(config, args):
                         batch_mode=config.T2DS.BATCH_MODE,
                         use_cls_token=config.T2D.USE_CLS_TOKEN,
                            )
+    elif args.framework == '2DSCLS12PONE':
+        model = CLIP2DSCLS12PONE(num_classes=config.DATA.NUM_CLASSES,
+                        pretrain=args.backbone_path,
+                        width=config.T2D.WIDTH,
+                        patch_size=config.T2D.PATCH_SIZE,
+                        layers=config.T2D.LAYERS,
+                        heads=config.T2D.HEADS,
+                        use_text_classifier=config.T2D.USE_TEXT_CLASSIFIER,
+                        temporal_model=config.T2D.TEMPORAL_MODEL,
+                        text_bias=config.T2D.TEXT_BIAS,
+                        text_dim=config.T2D.TEXT_DIM,
+                        text_heads=config.T2D.TEXT_HEADS,
+                        temporal_layer=config.T2D.TEMPORAL_LAYER,
+                        text_backbone_name=config.T2D.TEXT_BACKBONE_NAME,
+                        frames=config.DATA.NUM_FRAMES * config.DATA.CLIP_LEN,
+                        input_resolution=config.DATA.INPUT_SIZE,
+                        enable_checkpoint=config.TRAIN.USE_CHECKPOINT,
+                        imagenet_pretrain=config.T2D.IMAGENET_PRETRAIN,
+                        batch_mode=config.T2DS.BATCH_MODE,
+                        use_cls_token=config.T2D.USE_CLS_TOKEN,
+                           )
+    elif args.framework == '2DSCLS12PCA':
+        model = CLIP2DSCLS12PCA(num_classes=config.DATA.NUM_CLASSES,
+                        pretrain=args.backbone_path,
+                        width=config.T2D.WIDTH,
+                        patch_size=config.T2D.PATCH_SIZE,
+                        layers=config.T2D.LAYERS,
+                        heads=config.T2D.HEADS,
+                        use_text_classifier=config.T2D.USE_TEXT_CLASSIFIER,
+                        temporal_model=config.T2D.TEMPORAL_MODEL,
+                        text_bias=config.T2D.TEXT_BIAS,
+                        text_dim=config.T2D.TEXT_DIM,
+                        text_heads=config.T2D.TEXT_HEADS,
+                        temporal_layer=config.T2D.TEMPORAL_LAYER,
+                        text_backbone_name=config.T2D.TEXT_BACKBONE_NAME,
+                        frames=config.DATA.NUM_FRAMES * config.DATA.CLIP_LEN,
+                        input_resolution=config.DATA.INPUT_SIZE,
+                        enable_checkpoint=config.TRAIN.USE_CHECKPOINT,
+                        imagenet_pretrain=config.T2D.IMAGENET_PRETRAIN,
+                        batch_mode=config.T2DS.BATCH_MODE,
+                        use_cls_token=config.T2D.USE_CLS_TOKEN,
+                           )
+    elif args.framework == '2DSCLS12PCAV2':
+        model = CLIP2DSCLS12PCAV2(num_classes=config.DATA.NUM_CLASSES,
+                        pretrain=args.backbone_path,
+                        width=config.T2D.WIDTH,
+                        patch_size=config.T2D.PATCH_SIZE,
+                        layers=config.T2D.LAYERS,
+                        heads=config.T2D.HEADS,
+                        use_text_classifier=config.T2D.USE_TEXT_CLASSIFIER,
+                        temporal_model=config.T2D.TEMPORAL_MODEL,
+                        text_bias=config.T2D.TEXT_BIAS,
+                        text_dim=config.T2D.TEXT_DIM,
+                        text_heads=config.T2D.TEXT_HEADS,
+                        temporal_layer=config.T2D.TEMPORAL_LAYER,
+                        text_backbone_name=config.T2D.TEXT_BACKBONE_NAME,
+                        frames=config.DATA.NUM_FRAMES * config.DATA.CLIP_LEN,
+                        input_resolution=config.DATA.INPUT_SIZE,
+                        enable_checkpoint=config.TRAIN.USE_CHECKPOINT,
+                        imagenet_pretrain=config.T2D.IMAGENET_PRETRAIN,
+                        batch_mode=config.T2DS.BATCH_MODE,
+                        use_cls_token=config.T2D.USE_CLS_TOKEN,
+                           )
+    elif args.framework == '2DSCLS12PCAV3':
+        model = CLIP2DSCLS12PCAV3(num_classes=config.DATA.NUM_CLASSES,
+                        pretrain=args.backbone_path,
+                        width=config.T2D.WIDTH,
+                        patch_size=config.T2D.PATCH_SIZE,
+                        layers=config.T2D.LAYERS,
+                        heads=config.T2D.HEADS,
+                        use_text_classifier=config.T2D.USE_TEXT_CLASSIFIER,
+                        temporal_model=config.T2D.TEMPORAL_MODEL,
+                        text_bias=config.T2D.TEXT_BIAS,
+                        text_dim=config.T2D.TEXT_DIM,
+                        text_heads=config.T2D.TEXT_HEADS,
+                        temporal_layer=config.T2D.TEMPORAL_LAYER,
+                        text_backbone_name=config.T2D.TEXT_BACKBONE_NAME,
+                        frames=config.DATA.NUM_FRAMES * config.DATA.CLIP_LEN,
+                        input_resolution=config.DATA.INPUT_SIZE,
+                        enable_checkpoint=config.TRAIN.USE_CHECKPOINT,
+                        imagenet_pretrain=config.T2D.IMAGENET_PRETRAIN,
+                        batch_mode=config.T2DS.BATCH_MODE,
+                        use_cls_token=config.T2D.USE_CLS_TOKEN,
+                           )
+    elif args.framework == '2DSCLS12PCAV4':
+        model = CLIP2DSCLS12PCAV4(num_classes=config.DATA.NUM_CLASSES,
+                        pretrain=args.backbone_path,
+                        width=config.T2D.WIDTH,
+                        patch_size=config.T2D.PATCH_SIZE,
+                        layers=config.T2D.LAYERS,
+                        heads=config.T2D.HEADS,
+                        use_text_classifier=config.T2D.USE_TEXT_CLASSIFIER,
+                        temporal_model=config.T2D.TEMPORAL_MODEL,
+                        text_bias=config.T2D.TEXT_BIAS,
+                        text_dim=config.T2D.TEXT_DIM,
+                        text_heads=config.T2D.TEXT_HEADS,
+                        temporal_layer=config.T2D.TEMPORAL_LAYER,
+                        text_backbone_name=config.T2D.TEXT_BACKBONE_NAME,
+                        frames=config.DATA.NUM_FRAMES * config.DATA.CLIP_LEN,
+                        input_resolution=config.DATA.INPUT_SIZE,
+                        enable_checkpoint=config.TRAIN.USE_CHECKPOINT,
+                        imagenet_pretrain=config.T2D.IMAGENET_PRETRAIN,
+                        batch_mode=config.T2DS.BATCH_MODE,
+                        use_cls_token=config.T2D.USE_CLS_TOKEN,
+                           )
     elif args.framework == '2DSL':
         model = CLIP2DSL(num_classes=config.DATA.NUM_CLASSES,
                         pretrain=args.backbone_path,
@@ -289,7 +399,7 @@ def main(config, args):
         criterion = nn.CrossEntropyLoss()
     if args.framework in ['EVL', 'STREAM']:
         optimizer = build_optimizer_t2d(config, model, EVL_LR_CONFIG)
-    elif args.framework in ['T2D', 'T2DS', '2DS','2DSL','2DSLow','2DSCLS','2DSCLS12P']:
+    elif args.framework in ['T2D', 'T2DS', '2DS','2DSL','2DSLow','2DSCLS','2DSCLS12P','2DSCLS12PONE','2DSCLS12PCA','2DSCLS12PCAV2','2DSCLS12PCAV3','2DSCLS12PCAV4']:
         optimizer = build_optimizer_t2d(config, model, T2D_LR_CONFIG)
     else:
         optimizer = build_optimizer(config, model)

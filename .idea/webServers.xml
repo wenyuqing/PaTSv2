@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="d2c1594c-0941-4bd1-ad4f-8979f82120f2" name="224patsv2">
+        <fileTransfer accessType="SFTP" host="GCRSANDBOX224.redmond.corp.microsoft.com" port="22" sshConfigId="cb61431d-fe4f-4177-a4ea-99f8b24194ba" sshConfig="224" keyPair="true" />
+      </webServer>
+    </option>
+  </component>
+</project>

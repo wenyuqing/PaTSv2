@@ -1,0 +1,49 @@
+description: A2
+# lr1e5 tlr1e3
+target:
+   service: amlk8s
+   name: itphyperdgx2cl1
+   vc: hai1
+
+
+environment:
+  image: tangchuanxin/slowfast:deepspeed
+  registry: docker.io
+  username: wenyuqing
+  image_setup:
+    - pip install pathlib ftfy termcolor regex pandas
+    - pip install mmcv-full
+#    - git clone https://github.com/NVIDIA/apex
+#      cd apex
+#      pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./
+#      cd ..
+
+
+storage:
+  data:
+    storage_account_name: wu2train
+    container_name: datasets
+  model:
+    storage_account_name: wu2train
+    container_name: v-yuczhao
+
+code:
+  code_upload: True
+  local_dir: $CONFIG_DIR/../
+
+jobs:
+  - name: A3
+    sku: 2x32G16-V100
+    process_count_per_node: 1
+    mpi: true
+    command:
+      - bash tools/train_k600.sh configs/k600/16_32_T2D_tp1.yaml /mnt/model/clip_models/ViT-B-16.pt 2DSCLS12P
+        TRAIN.BATCH_SIZE 4 TRAIN.ACCUMULATION_STEPS 2 TRAIN.LR 8e-6 T2D.USE_TEXT_CLASSIFIER True
+        T2D.TEMPORAL_MODEL transformer TRAIN.AMP torch SAVE_NUM 2 T2D.USE_CLS_TOKEN True
+     # - sleep infinity
+    submit_args:
+      container_args:
+        shm_size: 512g
+    sla_tier: basic    # Default: basic
+    execution_mode: basic  # Default: basic
+    priority: high  # Default: medium

@@ -15,8 +15,7 @@ import clip
 from .prompt import VideoSpecificPrompt
 
 from .k400_class import K400_CLASS
-from .k600_class import K600_CLASS
-from visualize import visualize_heads,visualize_heads_avg
+
 
 SINGLE_PROMPT = ["a video of a person {}."]
 
@@ -135,6 +134,38 @@ def inflate_weight(state_dict_2d, state_dict_3d):
         state_dict_inflated[k] = v3d.clone()
     return state_dict_inflated
 
+# def inflate_weight(state_dict_2d, state_dict_3d):
+#     # copy from slowfast.checkpoint
+#     from collections import OrderedDict
+#     state_dict_inflated = OrderedDict()
+#     state_dict_inflated['class_embedding'] = state_dict_2d['cls_token'].squeeze()
+#     state_dict_inflated['positional_embedding'] = state_dict_2d['pos_embed'].squeeze()
+#     state_dict_inflated['conv1.weight'] = state_dict_2d['patch_embed.proj.weight']
+#     state_dict_inflated['ln_pre.weight'] = state_dict_2d['norm.weight']
+#     state_dict_inflated['ln_pre.bias'] = state_dict_2d['norm.bias']
+#     for i in range(12):
+#         state_dict_inflated['transformer.resblocks.' + str(i) + '.attn.in_proj_weight'] = state_dict_2d[
+#             'blocks.' + str(i) + '.attn.qkv.weight']
+#         state_dict_inflated['transformer.resblocks.' + str(i) + '.attn.in_proj_bias'] = state_dict_2d[
+#             'blocks.' + str(i) + '.attn.qkv.bias']
+#         state_dict_inflated['transformer.resblocks.' + str(i) + '.attn.out_proj.weight'] = state_dict_2d[
+#             'blocks.' + str(i) + '.attn.proj.weight']
+#         state_dict_inflated['transformer.resblocks.' + str(i) + '.attn.out_proj.bias'] = state_dict_2d[
+#             'blocks.' + str(i) + '.attn.proj.bias']
+#         state_dict_inflated['transformer.resblocks.' + str(i) + '.mlp.c_fc.weight'] = state_dict_2d[
+#             'blocks.' + str(i) + '.mlp.fc1.weight']
+#         state_dict_inflated['transformer.resblocks.' + str(i) + '.mlp.c_fc.bias'] = state_dict_2d[
+#             'blocks.' + str(i) + '.mlp.fc1.bias']
+#         state_dict_inflated['transformer.resblocks.' + str(i) + '.mlp.c_proj.weight'] = state_dict_2d[
+#             'blocks.' + str(i) + '.mlp.fc2.weight']
+#         state_dict_inflated['transformer.resblocks.' + str(i) + '.mlp.c_proj.bias'] = state_dict_2d[
+#             'blocks.' + str(i) + '.mlp.fc2.bias']
+#         for j in range(1,3):
+#             state_dict_inflated['transformer.resblocks.' + str(i) + '.ln_'+str(j)+'.weight'] = state_dict_2d[
+#                 'blocks.' + str(i) + '.norm'+str(j)+'.weight']
+#             state_dict_inflated['transformer.resblocks.' + str(i) + '.ln_'+str(j)+'.bias'] = state_dict_2d[
+#                 'blocks.' + str(i) + '.norm'+str(j)+'.bias']
+#     return state_dict_inflated
 
 class MySequential(nn.Sequential):
     def forward(self, *inputs):
@@ -160,7 +191,6 @@ class QuickGELU(nn.Module):
         return x * torch.sigmoid(1.702 * x)
 
 
-
 class Attention(nn.Module):
     def __init__(self,
                  embed_dim,
@@ -184,34 +214,30 @@ class Attention(nn.Module):
         constant_(self.in_proj_bias, 0.)
         constant_(self.out_proj.bias, 0.)
 
-    def attention(self, q, k, v, i,T,mask=None):
+    def attention(self, q, k, v, mask=None):
         attn = (q @ k.transpose(-2, -1))
         if mask is not None:
             attn = attn.masked_fill(mask, -1e3)
         attn = attn.softmax(-1)
-        # torch.save(attn, "attnmaps/attn.pt")
-        # y = torch.load("attnmaps/attn.pt")
-        if i==11:
-            visualize_heads_avg(attn[:1].cpu(),T,cols=4)
         o = (attn @ v)
         return o
 
-    def _forward_in_frame(self, x,i,T):
+    def _forward_in_frame(self, x):
         x = F.linear(x, self.in_proj_weight, self.in_proj_bias)
         qkv = rearrange(x, 'b n (three num_heads head_c) -> three b num_heads n head_c',
                         three=3, num_heads=self.num_heads)
         q, k, v = qkv.unbind(0)
         q = q * self.scale
 
-        x = self.attention(q, k, v,i,T)
+        x = self.attention(q, k, v)
 
         x = rearrange(x, 'b num_heads n head_c -> b n (num_heads head_c)')
         x = self.out_proj(x)
         return x
 
-    def forward(self, x, size,i,T):
+    def forward(self, x, size):
         """[B N C]"""
-        x = self._forward_in_frame(x,i,T)
+        x = self._forward_in_frame(x)
 
         return x
 
@@ -229,8 +255,8 @@ class ResidualAttentionBlock(nn.Module):
         ]))
         self.ln_2 = LayerNorm(d_model)
 
-    def forward(self, x: torch.Tensor, size,i,T):
-        x = x + self.attn(self.ln_1(x), size,i,T)
+    def forward(self, x: torch.Tensor, size):
+        x = x + self.attn(self.ln_1(x), size)
         x = x + self.mlp(self.ln_2(x))
         return x, size
 
@@ -285,6 +311,9 @@ class TransformerL(nn.Module):
         #self.resblocks = MySequential(*[ResidualAttentionBlock(width, heads, attn_type) for _ in range(layers)])
         self.resblocks = nn.ModuleList([ResidualAttentionBlock(width, heads, attn_type) for _ in range(layers)])
         self.enable_checkpoint = enable_checkpoint
+        # self.prompts_add_weights = nn.Parameter(torch.randn(layers-1))
+        # nn.init.constant_(self.prompts_add_weights,0.5)
+        #nn.init.zeros_(self.prompts_add_weights[:, 1])
 
     def forward(self, x: torch.Tensor, size,prompts_in,prompts_outs,T,prompts_pos):
         checkpoint_segment = 2
@@ -296,7 +325,7 @@ class TransformerL(nn.Module):
                 prompts = torch.cat([prompts_outs, prompts_in], dim=1) + prompts_pos
                 x = torch.cat([prompts, x], dim=1)
                 for i, blk in enumerate(self.resblocks):
-                    x, size = blk(x, size,i,T)
+                    x, size = blk(x, size)
             else:
                 for i,blk in enumerate(self.resblocks):
                     if i == 0:
@@ -304,10 +333,87 @@ class TransformerL(nn.Module):
                         x = torch.cat([prompts, x], dim=1)
                     else:
                         x[:, :4]= 0.5 * prompts_outs[:,:,i]  + 0.5 * x[:,:4]
-                    x,size = blk(x,size,i,T)
+                        # x_patch = x[:, 4:]
+                        # prompt_sum = self.prompts_add_weights[i - 1] * x[:, :4] + (1.0 - self.prompts_add_weights[i - 1]) * prompts_outs[:, :, i]
+                        # x = torch.cat([prompt_sum,x_patch], dim=1)
+                    x,size = blk(x,size)
             return x
 
-class CLIP2DSCLS12P(nn.Module):
+class Class_Attention(nn.Module):
+    # taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
+    # with slight modifications to do CA
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v = nn.Linear(dim, dim, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        q = self.q(x[:, :1]).reshape(B, 1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        k = self.k(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+
+        q = q * self.scale
+        v = self.v(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+
+        attn = (q @ k.transpose(-2, -1))
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x_cls = (attn @ v).transpose(1, 2).reshape(B, 1, C)
+        x_cls = self.proj(x_cls)
+        x_cls = self.proj_drop(x_cls)
+
+        return x_cls
+
+
+# class Block_CA(nn.Module):
+#     # taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
+#     # with slight modifications to add CA and LayerScale
+#     def __init__(self, dim, num_heads,  qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+#                  norm_layer=nn.LayerNorm, Attention_block=Class_Attention,
+#                  ):
+#         super().__init__()
+#         self.norm1 = norm_layer(dim)
+#         self.attn = Attention_block(
+#             dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+#         self.drop_path =  nn.Identity()
+#         self.norm2 = norm_layer(dim)
+#         #mlp_hidden_dim = int(dim * mlp_ratio)
+#         #self.mlp = Mlp_block(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+#         self.mlp = nn.Sequential(OrderedDict([
+#             ("c_fc", nn.Linear(dim, dim * 4)),
+#             ("gelu", QuickGELU()),
+#             ("c_proj", nn.Linear(dim * 4, dim))
+#         ]))
+#         #self.gamma_1 = nn.Parameter(init_values * torch.ones((dim)), requires_grad=True)
+#         #self.gamma_2 = nn.Parameter(init_values * torch.ones((dim)), requires_grad=True)
+#
+#     def forward(self, x, x_cls):
+#         u = torch.cat((x_cls, x), dim=1)
+#
+#         # x_cls = x_cls + self.drop_path(self.gamma_1 * self.attn(self.norm1(u)))
+#         #
+#         # x_cls = x_cls + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x_cls)))
+#
+#         x_cls = x_cls + self.drop_path(self.attn(self.norm1(u)))
+#
+#         x_cls = x_cls + self.drop_path(self.mlp(self.norm2(x_cls)))
+#
+#         return x_cls
+
+
+
+
+
+class CLIP2DSCLS12PCA(nn.Module):
     def __init__(self,
                  num_classes=400,
                  width=768,
@@ -338,7 +444,7 @@ class CLIP2DSCLS12P(nn.Module):
         self.frames = frames
         self.enable_checkpoint = enable_checkpoint
         self.use_text_classifier = use_text_classifier
-
+        self.layers=layers
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size[1:], stride=patch_size[1:],
                                bias=False)
         scale = width ** -0.5
@@ -356,7 +462,7 @@ class CLIP2DSCLS12P(nn.Module):
 
         self.prompts_projection = nn.Linear(width, width * layers, bias=False)
         self.prompts_projection_ln = nn.ModuleList([nn.LayerNorm(width) for _ in range(layers)])
-
+        self.prompts_ca=Class_Attention(width, num_heads=heads)
         self.ln_pre = LayerNorm(width)
         self.transformer = TransformerL(width, layers, heads, 'full', enable_checkpoint)
         self.ln_post = LayerNorm(width)
@@ -426,6 +532,36 @@ class CLIP2DSCLS12P(nn.Module):
         msg = self.load_state_dict(inflated_model_dict, strict=False)
         print(msg)
         print('Pretrained network weights loaded.')
+    # def _load_pretrain(self, pretrain):
+    #     if pretrain is None or not os.path.exists(pretrain):
+    #         return
+    #     print(f'Loading network weights from {pretrain}')
+    #     model_state_dict_3d = self.state_dict()
+    #
+    #     clip_model = torch.load(pretrain, map_location='cpu')
+    #     #clip_model = clip_model.visual
+    #     model_state_dict_2d = clip_model['model']
+    #
+    #     # remove pos embed for class token
+    #    # model_state_dict_2d['positional_embedding'] = model_state_dict_2d['positional_embedding'][1:]
+    #
+    #     inflated_model_dict = inflate_weight(model_state_dict_2d, model_state_dict_3d)
+    #     msg = self.load_state_dict(inflated_model_dict, strict=False)
+    #     print(msg)
+    #     print('Pretrained network weights loaded.')
+
+    # def _load_pretrain(self, pretrain):
+    #     if pretrain is None or not os.path.exists(pretrain):
+    #         return
+    #     print(f'Loading network weights from {pretrain}')
+    #     checkpoint = torch.load(pretrain, map_location='cpu')
+    #     load_state_dict = checkpoint['model']
+    #     model_state_dict_3d = self.state_dict()
+    #
+    #     print('inflate weights')
+    #     load_state_dict = inflate_weight(load_state_dict, model_state_dict_3d)
+    #     msg = self.load_state_dict(load_state_dict, strict=False)
+    #     print(f"resume model: {msg}")
 
     def forward_features(self, x: torch.Tensor):
         B = x.shape[0]
@@ -442,16 +578,22 @@ class CLIP2DSCLS12P(nn.Module):
         x = self.ln_pre(x)
 
         outs = []
+        prompts_out_his=[]
         prompts_in = self.prompts_embedding + torch.zeros(B, 1, 1, device=x.device)
         prompts_out = self.prompts_init_out + torch.zeros(B, 1, 1, device=x.device)
         for i in range(T):
             prompts_outs = []
             out = self.transformer(x[i],size,prompts_in,prompts_out,i,self.prompts_pos)
-            proj_out = rearrange(self.prompts_projection(out[:, 4:8]), 'b n (layers c) -> b n layers c', layers=12)
+            proj_out = rearrange(self.prompts_projection(out[:, 4:8]), 'b n (layers c) -> b n layers c', layers=self.layers)
             for i,ln in enumerate(self.prompts_projection_ln):
                 pout = ln(proj_out[:,:,i])
                 prompts_outs.append(pout)
             prompts_out = torch.stack(prompts_outs,dim=2)
+            prompts_out_his.append(prompts_out)
+            prompts_out_his_array=torch.stack(prompts_out_his,dim=2)
+            prompts_out_his_array=rearrange(prompts_out_his_array,'b n t l c -> (b n l) t c')
+            prompts_out=self.prompts_ca(prompts_out_his_array)
+            prompts_out=rearrange(prompts_out,'(b n l) 1 c -> b n 1 l c',n=4,l=12).squeeze(2)
             if self.use_cls_token:
                 outs.append(out[:, 8])
             else:
